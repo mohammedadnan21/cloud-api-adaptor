@@ -6,6 +6,8 @@ package proxy
 import (
 	"context"
 	b64 "encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -92,6 +94,51 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
 
 	if !pullImageInGuest {
 		logger.Printf("Pulling image separately not support on main. It is required to use the nydus-snapshotter, which isn't configured properly here.")
+	}
+
+	// Detect cloud volumes from mountInfo.json and pass as annotation
+	cloudVolumes := make(map[string]map[string]string)
+	cloudVolIdx := 0
+	if len(req.OCI.Mounts) > 0 {
+		for _, m := range req.OCI.Mounts {
+			if !isNodePublishVolumeTargetPath(m.Source, kataDirectVolumesDir) {
+				continue
+			}
+			encodedPath := b64.URLEncoding.EncodeToString([]byte(m.Source))
+			mountInfoPath := filepath.Join(kataDirectVolumesDir, encodedPath, "mountInfo.json")
+			data, err := os.ReadFile(mountInfoPath)
+			if err != nil {
+				logger.Printf("could not read mountInfo.json for %s: %v", m.Source, err)
+				continue
+			}
+			var mountInfo map[string]interface{}
+			if err := json.Unmarshal(data, &mountInfo); err != nil {
+				logger.Printf("could not parse mountInfo.json for %s: %v", m.Source, err)
+				continue
+			}
+			volInfo := map[string]string{
+				"mount_point": m.Destination,
+				"fs_type":     "ext4",
+				"lun":         fmt.Sprintf("%d", cloudVolIdx),
+			}
+			if md, ok := mountInfo["metadata"].(map[string]interface{}); ok {
+				for k, v := range md {
+					volInfo[k] = fmt.Sprintf("%v", v)
+				}
+			}
+			volKey := fmt.Sprintf("vol-%d", cloudVolIdx)
+			cloudVolumes[volKey] = volInfo
+			cloudVolIdx++
+			logger.Printf("Detected cloud volume %s -> %s (lun=%s)", volKey, m.Destination, volInfo["lun"])
+		}
+	}
+	if len(cloudVolumes) > 0 {
+		cvJSON, _ := json.Marshal(cloudVolumes)
+		if req.OCI.Annotations == nil {
+			req.OCI.Annotations = make(map[string]string)
+		}
+		req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"] = string(cvJSON)
+		logger.Printf("Set cloud_volumes annotation: %s", string(cvJSON))
 	}
 
 	res, err := s.Redirector.CreateContainer(ctx, req)

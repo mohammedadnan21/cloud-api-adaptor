@@ -283,7 +283,7 @@ func (p *azureProvider) CreateInstance(ctx context.Context, podName, sandboxID s
 		imageID = spec.Image
 	}
 
-	vmParameters, err := p.getVMParameters(instanceSize, diskName, cloudConfigData, sshBytes, instanceName, nicName, imageID)
+	vmParameters, err := p.getVMParameters(instanceSize, diskName, cloudConfigData, sshBytes, instanceName, nicName, imageID, spec.Volumes)
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +422,7 @@ func (p *azureProvider) getResourceTags() map[string]*string {
 	return tags
 }
 
-func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig string, sshBytes []byte, instanceName, nicName string, imageID string) (*armcompute.VirtualMachine, error) {
+func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig string, sshBytes []byte, instanceName, nicName string, imageID string, csiVolumes []provider.CloudVolume) (*armcompute.VirtualMachine, error) {
 	userDataB64 := base64.StdEncoding.EncodeToString([]byte(cloudConfig))
 
 	// Azure limits the base64 encrypted userData to 64KB.
@@ -482,6 +482,20 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 		logger.Printf("Setting root volume size to %d GB", p.serviceConfig.RootVolumeSize)
 	}
 
+	// Attach CSI volumes as data disks
+	var dataDisks []*armcompute.DataDisk
+	for i, vol := range csiVolumes {
+		logger.Printf("Attaching data disk: LUN %d, ID: %s", i, vol.DiskID)
+		dataDisks = append(dataDisks, &armcompute.DataDisk{
+			Lun:          to.Ptr(int32(i)),
+			CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesAttach),
+			DeleteOption: to.Ptr(armcompute.DiskDeleteOptionTypesDetach),
+			ManagedDisk: &armcompute.ManagedDiskParameters{
+				ID: to.Ptr(vol.DiskID),
+			},
+		})
+	}
+
 	vmParameters := armcompute.VirtualMachine{
 		Location: to.Ptr(p.serviceConfig.Region),
 		Properties: &armcompute.VirtualMachineProperties{
@@ -491,6 +505,7 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 			StorageProfile: &armcompute.StorageProfile{
 				ImageReference: imgRef,
 				OSDisk:         osDisk,
+				DataDisks:      dataDisks,
 			},
 			OSProfile: &armcompute.OSProfile{
 				AdminUsername: to.Ptr(p.serviceConfig.SSHUserName),

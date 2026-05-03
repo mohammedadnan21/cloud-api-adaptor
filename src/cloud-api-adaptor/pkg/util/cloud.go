@@ -1,11 +1,16 @@
 package util
 
 import (
+	b64 "encoding/base64"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
+	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
 	cri "github.com/containerd/containerd/pkg/cri/annotations"
 	hypannotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 )
@@ -113,4 +118,66 @@ func Contains(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+type mountInfoJSON struct {
+	VolumeType string            `json:"volume-type"`
+	Device     string            `json:"device"`
+	FsType     string            `json:"fstype"`
+	Metadata   map[string]string `json:"metadata"`
+	Options    []string          `json:"options"`
+}
+
+const (
+	kataDirectVolumesDir         = "/run/kata-containers/shared/direct-volumes"
+	csiPluginEscapeQualifiedName = "kubernetes.io~csi"
+)
+
+// GetCSIVolumesForPod scans the shared direct-volumes directory for
+// mountInfo.json files written by the CSI block driver. Each file
+// describes a cloud volume that should be attached to the PodVM.
+func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
+	var volumes []provider.CloudVolume
+
+	entries, err := os.ReadDir(kataDirectVolumesDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		mountInfoPath := filepath.Join(kataDirectVolumesDir, entry.Name(), "mountInfo.json")
+		data, err := os.ReadFile(mountInfoPath)
+		if err != nil {
+			continue
+		}
+
+		var info mountInfoJSON
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+
+		volPath := info.Device
+		if info.Metadata != nil {
+			if cp, ok := info.Metadata["cloud-volume-path"]; ok {
+				volPath = cp
+			}
+		}
+
+		if volPath == "" {
+			continue
+		}
+
+		decodedPath, err := b64.URLEncoding.DecodeString(entry.Name())
+		if err == nil && strings.Contains(string(decodedPath), "/volumes/"+csiPluginEscapeQualifiedName+"/") {
+			volumes = append(volumes, provider.CloudVolume{
+				DiskID: volPath,
+			})
+		}
+	}
+
+	return volumes
 }
