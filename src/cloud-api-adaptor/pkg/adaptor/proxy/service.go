@@ -96,49 +96,104 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
 		logger.Printf("Pulling image separately not support on main. It is required to use the nydus-snapshotter, which isn't configured properly here.")
 	}
 
-	// Detect cloud volumes from mountInfo.json and pass as annotation
+	// Detect cloud volumes by scanning kataDirectVolumesDir in canonical order.
+	// The scan order matches GetCSIVolumesForPod (os.ReadDir sorts by name),
+	// so the LUN index here is consistent with the cloud provider's disk
+	// attachment order.
 	cloudVolumes := make(map[string]map[string]string)
-	cloudVolIdx := 0
-	if len(req.OCI.Mounts) > 0 {
-		for _, m := range req.OCI.Mounts {
-			if !isNodePublishVolumeTargetPath(m.Source, kataDirectVolumesDir) {
+	podUID := ""
+	if req.OCI.Annotations != nil {
+		podUID = req.OCI.Annotations["io.kubernetes.cri.sandbox-uid"]
+	}
+
+	dirEntries, dirErr := os.ReadDir(kataDirectVolumesDir)
+	if dirErr == nil {
+		canonicalIdx := 0
+		for _, entry := range dirEntries {
+			if !entry.IsDir() {
 				continue
 			}
-			encodedPath := b64.URLEncoding.EncodeToString([]byte(m.Source))
-			mountInfoPath := filepath.Join(kataDirectVolumesDir, encodedPath, "mountInfo.json")
+			decodedBytes, err := b64.URLEncoding.DecodeString(entry.Name())
+			if err != nil {
+				continue
+			}
+			decodedPath := string(decodedBytes)
+
+			if !strings.Contains(decodedPath, "/volumes/"+csiPluginEscapeQualifiedName+"/") {
+				continue
+			}
+			if podUID != "" && !strings.Contains(decodedPath, podUID) {
+				continue
+			}
+
+			mountInfoPath := filepath.Join(kataDirectVolumesDir, entry.Name(), "mountInfo.json")
 			data, err := os.ReadFile(mountInfoPath)
 			if err != nil {
-				logger.Printf("could not read mountInfo.json for %s: %v", m.Source, err)
+				logger.Printf("could not read mountInfo.json for %s: %v", decodedPath, err)
 				continue
 			}
 			var mountInfo map[string]interface{}
 			if err := json.Unmarshal(data, &mountInfo); err != nil {
-				logger.Printf("could not parse mountInfo.json for %s: %v", m.Source, err)
+				logger.Printf("could not parse mountInfo.json for %s: %v", decodedPath, err)
 				continue
 			}
-			volInfo := map[string]string{
-				"mount_point": m.Destination,
-				"fs_type":     "ext4",
-				"lun":         fmt.Sprintf("%d", cloudVolIdx),
-			}
+
+			diskID := ""
 			if md, ok := mountInfo["metadata"].(map[string]interface{}); ok {
-				for k, v := range md {
-					volInfo[k] = fmt.Sprintf("%v", v)
+				if cp, ok := md["cloud-volume-path"].(string); ok && cp != "" {
+					diskID = cp
 				}
 			}
-			volKey := fmt.Sprintf("vol-%d", cloudVolIdx)
-			cloudVolumes[volKey] = volInfo
-			cloudVolIdx++
-			logger.Printf("Detected cloud volume %s -> %s (lun=%s)", volKey, m.Destination, volInfo["lun"])
+			if diskID == "" {
+				if d, ok := mountInfo["device"].(string); ok {
+					diskID = d
+				}
+			}
+			if diskID == "" {
+				logger.Printf("cloud volume at %s has no disk ID, skipping", decodedPath)
+				continue
+			}
+
+			fsType := "ext4"
+			if ft, ok := mountInfo["fstype"].(string); ok && ft != "" {
+				fsType = ft
+			}
+
+			mountDest := ""
+			for _, m := range req.OCI.Mounts {
+				if m.Source == decodedPath {
+					mountDest = m.Destination
+					break
+				}
+			}
+			if mountDest == "" {
+				logger.Printf("cloud volume disk %s has no matching mount in container spec, skipping", diskID)
+				continue
+			}
+
+			volKey := fmt.Sprintf("vol-%d", canonicalIdx)
+			cloudVolumes[volKey] = map[string]string{
+				"mount_point": mountDest,
+				"fs_type":     fsType,
+				"lun":         fmt.Sprintf("%d", canonicalIdx),
+				"disk_id":     diskID,
+			}
+			logger.Printf("Detected cloud volume %s -> %s (lun=%d, disk=%s, fs=%s)", volKey, mountDest, canonicalIdx, diskID, fsType)
+			canonicalIdx++
 		}
 	}
+
 	if len(cloudVolumes) > 0 {
-		cvJSON, _ := json.Marshal(cloudVolumes)
-		if req.OCI.Annotations == nil {
-			req.OCI.Annotations = make(map[string]string)
+		cvJSON, err := json.Marshal(cloudVolumes)
+		if err != nil {
+			logger.Printf("failed to marshal cloud_volumes annotation: %v", err)
+		} else {
+			if req.OCI.Annotations == nil {
+				req.OCI.Annotations = make(map[string]string)
+			}
+			req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"] = string(cvJSON)
+			logger.Printf("Set cloud_volumes annotation: %s", string(cvJSON))
 		}
-		req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"] = string(cvJSON)
-		logger.Printf("Set cloud_volumes annotation: %s", string(cvJSON))
 	}
 
 	res, err := s.Redirector.CreateContainer(ctx, req)

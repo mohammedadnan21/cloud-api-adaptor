@@ -136,8 +136,12 @@ const (
 // GetCSIVolumesForPod scans the shared direct-volumes directory for
 // mountInfo.json files written by the CSI block driver. Each file
 // describes a cloud volume that should be attached to the PodVM.
+// Volumes are filtered by pod UID (from annotations) to prevent
+// cross-pod volume leakage on multi-tenant nodes.
 func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
 	var volumes []provider.CloudVolume
+
+	podUID := annotations[cri.SandboxUID]
 
 	entries, err := os.ReadDir(kataDirectVolumesDir)
 	if err != nil {
@@ -149,6 +153,20 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
 			continue
 		}
 
+		decodedPath, err := b64.URLEncoding.DecodeString(entry.Name())
+		if err != nil {
+			continue
+		}
+		decodedStr := string(decodedPath)
+
+		if !strings.Contains(decodedStr, "/volumes/"+csiPluginEscapeQualifiedName+"/") {
+			continue
+		}
+
+		if podUID != "" && !strings.Contains(decodedStr, podUID) {
+			continue
+		}
+
 		mountInfoPath := filepath.Join(kataDirectVolumesDir, entry.Name(), "mountInfo.json")
 		data, err := os.ReadFile(mountInfoPath)
 		if err != nil {
@@ -157,26 +175,25 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
 
 		var info mountInfoJSON
 		if err := json.Unmarshal(data, &info); err != nil {
+			fmt.Printf("warning: invalid mountInfo.json in %s: %v\n", entry.Name(), err)
 			continue
 		}
 
 		volPath := info.Device
 		if info.Metadata != nil {
-			if cp, ok := info.Metadata["cloud-volume-path"]; ok {
+			if cp, ok := info.Metadata["cloud-volume-path"]; ok && cp != "" {
 				volPath = cp
 			}
 		}
 
 		if volPath == "" {
+			fmt.Printf("warning: no disk ID in mountInfo.json for %s\n", decodedStr)
 			continue
 		}
 
-		decodedPath, err := b64.URLEncoding.DecodeString(entry.Name())
-		if err == nil && strings.Contains(string(decodedPath), "/volumes/"+csiPluginEscapeQualifiedName+"/") {
-			volumes = append(volumes, provider.CloudVolume{
-				DiskID: volPath,
-			})
-		}
+		volumes = append(volumes, provider.CloudVolume{
+			DiskID: volPath,
+		})
 	}
 
 	return volumes

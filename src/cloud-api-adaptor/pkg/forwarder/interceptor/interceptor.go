@@ -33,6 +33,12 @@ const (
 	volumeCheckTimeout   = 3 * time.Minute
 )
 
+var allowedFSTypes = map[string]bool{
+	"ext4": true,
+	"ext3": true,
+	"xfs":  true,
+}
+
 var logger = log.New(log.Writer(), "[forwarder/interceptor] ", log.LstdFlags|log.Lmsgprefix)
 
 type Interceptor interface {
@@ -102,7 +108,7 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
 	}
 
 	// Handle cloud volumes: detect device, format if needed, mount, and
-	// bind-mount into the container's mount namespace
+	// bind-mount into the container's mount namespace.
 	if cvJSON, ok := req.OCI.Annotations[cloudVolumesKey]; ok && cvJSON != "" {
 		var cloudVolumes map[string]map[string]string
 		if err := json.Unmarshal([]byte(cvJSON), &cloudVolumes); err != nil {
@@ -116,6 +122,21 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
 					logger.Printf("cloud volume %s missing mount_point or lun, skipping", volName)
 					continue
 				}
+
+				safeName := filepath.Base(volName)
+				if safeName != volName || safeName == "." || safeName == ".." {
+					logger.Printf("cloud volume %q has unsafe name, skipping", volName)
+					continue
+				}
+
+				if fsType == "" {
+					fsType = "ext4"
+				}
+				if !allowedFSTypes[fsType] {
+					logger.Printf("cloud volume %s requests unsupported fs_type %q, skipping", volName, fsType)
+					continue
+				}
+
 				lunIdx, err := strconv.Atoi(lunStr)
 				if err != nil {
 					logger.Printf("cloud volume %s has invalid lun %q: %v", volName, lunStr, err)
@@ -128,7 +149,7 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
 				}
 				logger.Printf("cloud volume %s: LUN %d -> device %s", volName, lunIdx, device)
 
-				hostMountPoint := filepath.Join(cloudVolumeMountBase, volName)
+				hostMountPoint := filepath.Join(cloudVolumeMountBase, safeName)
 				if err := os.MkdirAll(hostMountPoint, 0o755); err != nil {
 					return nil, fmt.Errorf("creating mount point for %s: %w", volName, err)
 				}
@@ -141,14 +162,18 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
 					return nil, fmt.Errorf("failed to mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
 				}
 
-				// Rewrite mount source to point to the host mount point
+				rewrote := false
 				for idx, m := range req.OCI.Mounts {
 					if m.Destination == mountPoint {
 						req.OCI.Mounts[idx].Source = hostMountPoint
 						req.OCI.Mounts[idx].Type = "bind"
 						logger.Printf("cloud volume %s: rewrote mount source to %s", volName, hostMountPoint)
+						rewrote = true
 						break
 					}
+				}
+				if !rewrote {
+					logger.Printf("WARNING: cloud volume %s mount_point %q not found in container mounts", volName, mountPoint)
 				}
 			}
 		}
@@ -289,22 +314,63 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
 	return res, err
 }
 
+// detectCloudProvider determines the cloud platform by probing
+// provider-specific device paths inside the PodVM.
+func detectCloudProvider() string {
+	if _, err := os.Stat("/dev/disk/azure"); err == nil {
+		return "azure"
+	}
+	if matches, _ := filepath.Glob("/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*"); len(matches) > 0 {
+		return "aws"
+	}
+	if matches, _ := filepath.Glob("/dev/vd[a-z]"); len(matches) > 0 {
+		return "libvirt"
+	}
+	return "generic"
+}
+
 // findDataDiskDevice locates the block device for the given LUN index.
-// It tries Azure-specific symlinks first, then falls back to scanning sysfs.
+// It auto-detects the cloud provider and uses provider-specific paths,
+// then falls back to sysfs HCTL-based LUN matching.
 func findDataDiskDevice(lunIdx int) (string, error) {
-	// Azure udev symlinks (from azure-vm-utils package)
+	provider := detectCloudProvider()
+	logger.Printf("Cloud provider detected: %s (LUN %d)", provider, lunIdx)
+
+	switch provider {
+	case "azure":
+		if dev, err := findAzureDataDisk(lunIdx); err == nil {
+			return dev, nil
+		}
+	case "aws":
+		if dev, err := findAWSDataDisk(lunIdx); err == nil {
+			return dev, nil
+		}
+	case "libvirt":
+		if dev, err := findLibvirtDataDisk(lunIdx); err == nil {
+			return dev, nil
+		}
+	}
+
+	if dev, err := findDataDiskBySysfsHCTL(lunIdx); err == nil {
+		return dev, nil
+	}
+
+	dumpBlockDeviceDiagnostics()
+	return "", fmt.Errorf("no data disk found for LUN %d (provider=%s)", lunIdx, provider)
+}
+
+func findAzureDataDisk(lunIdx int) (string, error) {
 	azurePaths := []string{
 		fmt.Sprintf("/dev/disk/azure/data/by-lun/%d", lunIdx),
 		fmt.Sprintf("/dev/disk/azure/scsi1/lun%d", lunIdx),
 	}
 	for _, p := range azurePaths {
 		if target, err := filepath.EvalSymlinks(p); err == nil {
-			logger.Printf("Found data disk via Azure symlink %s -> %s", p, target)
+			logger.Printf("Found Azure data disk: %s -> %s", p, target)
 			return target, nil
 		}
 	}
 
-	// Hyper-V by-path: /dev/disk/by-path/acpi-VMBUS:00-vmbus-<guid>-lun-<N>
 	byPathDir := "/dev/disk/by-path"
 	if entries, err := os.ReadDir(byPathDir); err == nil {
 		lunSuffix := fmt.Sprintf("-lun-%d", lunIdx)
@@ -313,41 +379,86 @@ func findDataDiskDevice(lunIdx int) (string, error) {
 			if strings.Contains(name, "vmbus") && strings.HasSuffix(name, lunSuffix) && !strings.Contains(name, "part") {
 				fullPath := filepath.Join(byPathDir, name)
 				if target, err := filepath.EvalSymlinks(fullPath); err == nil {
-					logger.Printf("Found data disk via by-path %s -> %s", fullPath, target)
+					logger.Printf("Found Azure data disk via by-path: %s -> %s", fullPath, target)
 					return target, nil
 				}
 			}
 		}
 	}
+	return "", fmt.Errorf("Azure data disk LUN %d not found", lunIdx)
+}
 
-	// Fallback: find block devices without partitions (data disks typically
-	// have no partition table, unlike OS/resource disks)
-	sysBlock := "/sys/block"
-	entries, err := os.ReadDir(sysBlock)
-	if err != nil {
-		return "", fmt.Errorf("cannot read %s: %w", sysBlock, err)
+func findAWSDataDisk(lunIdx int) (string, error) {
+	entries, err := filepath.Glob("/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*")
+	if err != nil || len(entries) == 0 {
+		return "", fmt.Errorf("no AWS EBS NVMe devices found")
 	}
-
 	var candidates []string
 	for _, e := range entries {
+		if !strings.Contains(e, "-part") {
+			candidates = append(candidates, e)
+		}
+	}
+	if lunIdx >= len(candidates) {
+		return "", fmt.Errorf("AWS EBS disk index %d out of range (have %d)", lunIdx, len(candidates))
+	}
+	target, err := filepath.EvalSymlinks(candidates[lunIdx])
+	if err != nil {
+		return "", err
+	}
+	logger.Printf("Found AWS EBS disk: %s -> %s", candidates[lunIdx], target)
+	return target, nil
+}
+
+func findLibvirtDataDisk(lunIdx int) (string, error) {
+	devLetter := 'b' + rune(lunIdx)
+	if devLetter > 'z' {
+		return "", fmt.Errorf("LUN index %d out of range for virtio devices", lunIdx)
+	}
+	device := fmt.Sprintf("/dev/vd%c", devLetter)
+	if _, err := os.Stat(device); err == nil {
+		logger.Printf("Found libvirt virtio disk: %s", device)
+		return device, nil
+	}
+	return "", fmt.Errorf("libvirt device %s not found", device)
+}
+
+// findDataDiskBySysfsHCTL matches block devices by their SCSI HCTL
+// (Host:Channel:Target:Lun) address in sysfs rather than relying on
+// directory listing order.
+func findDataDiskBySysfsHCTL(lunIdx int) (string, error) {
+	entries, err := os.ReadDir("/sys/block")
+	if err != nil {
+		return "", fmt.Errorf("cannot read /sys/block: %w", err)
+	}
+
+	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, "sd") && !strings.HasPrefix(name, "nvme") {
+		if !strings.HasPrefix(name, "sd") && !strings.HasPrefix(name, "nvme") && !strings.HasPrefix(name, "vd") {
 			continue
 		}
-		partEntries, err := filepath.Glob(filepath.Join(sysBlock, name, name+"*"))
-		if err != nil || len(partEntries) > 0 {
+
+		devicePath := filepath.Join("/sys/block", name, "device")
+		realPath, err := filepath.EvalSymlinks(devicePath)
+		if err != nil {
 			continue
 		}
-		candidates = append(candidates, "/dev/"+name)
+
+		parts := strings.Split(realPath, "/")
+		for _, part := range parts {
+			hctl := strings.Split(part, ":")
+			if len(hctl) == 4 {
+				lun, err := strconv.Atoi(hctl[3])
+				if err == nil && lun == lunIdx {
+					dev := "/dev/" + name
+					logger.Printf("Found data disk via sysfs HCTL: %s (LUN %d from %s)", dev, lunIdx, part)
+					return dev, nil
+				}
+			}
+		}
 	}
 
-	if lunIdx < len(candidates) {
-		logger.Printf("Found data disk via sysfs heuristic: %s (lun=%d)", candidates[lunIdx], lunIdx)
-		return candidates[lunIdx], nil
-	}
-
-	dumpBlockDeviceDiagnostics()
-	return "", fmt.Errorf("no data disk found for LUN %d (candidates: %v)", lunIdx, candidates)
+	return "", fmt.Errorf("no data disk found for LUN %d via sysfs HCTL", lunIdx)
 }
 
 func dumpBlockDeviceDiagnostics() {
@@ -387,6 +498,14 @@ func waitForDevice(device string) error {
 func formatAndMount(device, mountPoint, fsType string) error {
 	if fsType == "" {
 		fsType = "ext4"
+	}
+	if !allowedFSTypes[fsType] {
+		return fmt.Errorf("unsupported filesystem type %q", fsType)
+	}
+
+	if alreadyMounted, err := mountinfo.Mounted(mountPoint); err == nil && alreadyMounted {
+		logger.Printf("Mount point %s is already mounted, treating as success", mountPoint)
+		return nil
 	}
 
 	// Try mounting first — if the disk already has a valid filesystem, this
