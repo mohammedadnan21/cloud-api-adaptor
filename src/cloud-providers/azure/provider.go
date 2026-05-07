@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -485,9 +486,12 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 	// Attach CSI volumes as data disks
 	var dataDisks []*armcompute.DataDisk
 	for i, vol := range csiVolumes {
+		if i > math.MaxInt32 {
+			return nil, fmt.Errorf("LUN index %d exceeds maximum", i)
+		}
 		logger.Printf("Attaching data disk: LUN %d, ID: %s", i, vol.DiskID)
 		dataDisks = append(dataDisks, &armcompute.DataDisk{
-			Lun:          to.Ptr(int32(i)),
+			Lun:          to.Ptr(int32(i)), //nolint:gosec // bounded above
 			CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesAttach),
 			DeleteOption: to.Ptr(armcompute.DiskDeleteOptionTypesDetach),
 			ManagedDisk: &armcompute.ManagedDiskParameters{

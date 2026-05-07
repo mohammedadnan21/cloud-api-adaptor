@@ -411,10 +411,10 @@ func findAWSDataDisk(lunIdx int) (string, error) {
 }
 
 func findLibvirtDataDisk(lunIdx int) (string, error) {
-	devLetter := 'b' + rune(lunIdx)
-	if devLetter > 'z' {
-		return "", fmt.Errorf("LUN index %d out of range for virtio devices", lunIdx)
+	if lunIdx < 0 || lunIdx > 24 {
+		return "", fmt.Errorf("LUN index %d out of range for virtio devices (0-24)", lunIdx)
 	}
+	devLetter := 'b' + rune(lunIdx)
 	device := fmt.Sprintf("/dev/vd%c", devLetter)
 	if _, err := os.Stat(device); err == nil {
 		logger.Printf("Found libvirt virtio disk: %s", device)
